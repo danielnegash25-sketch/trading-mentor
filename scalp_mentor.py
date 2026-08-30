@@ -38,7 +38,7 @@ from typing import Optional
 
 import anthropic
 
-MODEL = "claude-opus-4-1-20250805"  # swap for whichever model you want to use
+MODEL = "claude-sonnet-5"  # swap for whichever model you want to use
 MAX_TOKENS = 1500
 
 
