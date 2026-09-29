@@ -1,9 +1,8 @@
 """
-S.C.A.L.P. AI Trading Mentor — Streamlit UI
+Harmonized EMA 20/40 + Price Action AI Trading Mentor — Streamlit UI
 
-A local web app around scalp_mentor.py: upload your 1H/M5/M1
-screenshots, get a stage-by-stage verdict, and log the outcome later
-so you can track calibration against your KPI targets.
+Upload your 1H, 15M, and 5M screenshots, get a stage-by-stage verdict,
+and log the outcome later so you can track calibration.
 
 SETUP:
     pip install streamlit anthropic --break-system-packages
@@ -12,74 +11,91 @@ SETUP:
 RUN:
     streamlit run app.py
 
-This is a decision-support / checklist tool, not financial advice —
-treat its output as a second opinion to check your own read of the
-chart against, not a signal to act on automatically.
+Decision-support / checklist tool, not financial advice.
 """
 
 import csv
 import os
-from datetime import datetime, date
+from datetime import datetime
 
 import streamlit as st
 import anthropic
 
-from scalp_mentor import run_scalp_analysis, get_sl_config
+from scalp_mentor import run_scalp_analysis, get_sl_config, DEFAULT_MIN_RR
 
 LOG_PATH = "trade_log.csv"
 LOG_FIELDS = [
-    "timestamp", "pair", "verdict", "s_pass", "c_pass", "a_pass",
-    "l_pass", "p_pass", "failing_stages", "outcome", "notes",
+    "timestamp", "pair", "environment", "verdict",
+    "t_pass", "p_pass", "e_pass", "failing_stages", "outcome", "notes",
 ]
 
-st.set_page_config(page_title="SCALP AI Mentor", layout="wide")
-st.title("S.C.A.L.P. AI Trading Mentor")
+st.set_page_config(page_title="EMA 20/40 AI Mentor", layout="wide")
+st.title("Harmonized EMA 20/40 + Price Action Mentor")
 st.caption("Decision support, not financial advice — verify against your own chart reading.")
 
-# --- Sidebar: inputs -------------------------------------------------------
 with st.sidebar:
     st.header("Setup")
     pair = st.selectbox("Instrument", ["XAUUSD", "NAS100", "EURUSD", "GBPUSD", "Other"])
     if pair == "Other":
         pair = st.text_input("Enter instrument symbol", "")
-    current_time = st.text_input("Current time (GMT, HH:MM)", datetime.utcnow().strftime("%H:%M"))
     sl_config = get_sl_config(pair) if pair else {}
-    if sl_config:
-        st.caption(f"Stop-loss reference for {pair}: {sl_config['range']} ({sl_config['unit']})")
+
+    st.subheader("Stop-loss / Take-profit")
+    sl_unit = st.text_input(
+        "Stop-loss unit",
+        value=sl_config.get("unit", ""),
+        help="e.g. 'pips', 'USD (price points)', 'index points'",
+    )
+    min_rr = st.text_input(
+        "Minimum risk:reward",
+        value=DEFAULT_MIN_RR,
+        help="Strategy minimum — a setup failing this bar is AVOID even if everything else looks clean",
+    )
+
+    st.divider()
+    st.caption(
+        "Risk rules (reminder, not enforced by this app): "
+        "0.25% risk per trade · 0.75% max daily loss · stop after 2 losses in a day · "
+        "never widen a stop to avoid a loss."
+    )
 
 st.subheader("1. Upload charts")
 col1, col2, col3 = st.columns(3)
 with col1:
-    h1_file = st.file_uploader("1H chart (Spot Impulse / Premium-Discount)", type=["png", "jpg", "jpeg"], key="h1")
+    h1_file = st.file_uploader("1H chart — Trend Filter (EMA 20/40)", type=["png", "jpg", "jpeg"], key="h1")
 with col2:
-    m5_file = st.file_uploader("M5 chart (Assess POI / Liquidity Grab)", type=["png", "jpg", "jpeg"], key="m5")
+    m15_file = st.file_uploader("15M chart — Pullback / POI / Liquidity", type=["png", "jpg", "jpeg"], key="m15")
 with col3:
-    m1_file = st.file_uploader("M1 chart (Position Entry)", type=["png", "jpg", "jpeg"], key="m1")
+    m5_file = st.file_uploader("5M chart — Execution (MSS) / Risk", type=["png", "jpg", "jpeg"], key="m5")
 
-for label, f in [("1H", h1_file), ("M5", m5_file), ("M1", m1_file)]:
+for label, f in [("1H", h1_file), ("15M", m15_file), ("5M", m5_file)]:
     if f is not None:
         st.image(f, caption=label, width=250)
 
-# --- Run analysis ------------------------------------------------------------
 st.subheader("2. Run analysis")
 
-if st.button("Analyze setup", type="primary", disabled=not (h1_file and m5_file and m1_file and pair)):
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+if st.button("Analyze setup", type="primary", disabled=not (h1_file and m15_file and m5_file and pair)):
+    api_key = st.secrets.get("ANTHROPIC_API_KEY", None) if hasattr(st, "secrets") else None
     if not api_key:
-        st.error("ANTHROPIC_API_KEY environment variable is not set.")
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        st.error(
+            "No API key found. Set ANTHROPIC_API_KEY as an environment variable, "
+            "or create a .streamlit/secrets.toml file with ANTHROPIC_API_KEY = \"your-key\"."
+        )
     else:
-        # Save uploads to temp paths since the analysis functions expect file paths
         tmp_paths = {}
-        for label, f in [("h1", h1_file), ("m5", m5_file), ("m1", m1_file)]:
+        for label, f in [("h1", h1_file), ("m15", m15_file), ("m5", m5_file)]:
             tmp_path = f"_tmp_{label}_{f.name}"
             with open(tmp_path, "wb") as out:
                 out.write(f.getbuffer())
             tmp_paths[label] = tmp_path
 
         client = anthropic.Anthropic(api_key=api_key)
-        with st.spinner("Running SCALP stages..."):
+        with st.spinner("Running Trend Filter -> Pullback/POI/Liquidity -> Execution/Risk..."):
             result = run_scalp_analysis(
-                client, tmp_paths["h1"], tmp_paths["m5"], tmp_paths["m1"], pair, current_time
+                client, tmp_paths["h1"], tmp_paths["m15"], tmp_paths["m5"], pair,
+                sl_unit=sl_unit, min_rr=min_rr,
             )
 
         for path in tmp_paths.values():
@@ -87,20 +103,19 @@ if st.button("Analyze setup", type="primary", disabled=not (h1_file and m5_file 
 
         st.session_state["last_result"] = result
 
-# --- Display results ---------------------------------------------------------
 if "last_result" in st.session_state:
     result = st.session_state["last_result"]
     st.subheader("3. Result")
-
     if result["final_verdict"] == "EXECUTE":
-        st.success(f"**VERDICT: EXECUTE** — {pair}")
+        st.success(f"VERDICT: EXECUTE — {pair} ({result['environment']})")
     else:
-        st.warning(f"**VERDICT: AVOID** — {pair}")
+        st.warning(f"VERDICT: AVOID — {pair} (1H environment: {result['environment']})")
         st.write(f"Failing stages: {', '.join(result['failing_stages'])}")
 
+    stage_labels = {"T": "Trend Filter (1H)", "P": "Pullback/POI/Liquidity (15M)", "E": "Execution/Risk (5M)"}
     for key, data in result["stages"].items():
         icon = "PASS" if data["passed"] else "FAIL"
-        with st.expander(f"[{key}] {icon} — {data['reasoning'][:80]}"):
+        with st.expander(f"[{stage_labels.get(key, key)}] {icon} — {data['reasoning'][:80]}"):
             st.json(data["details"])
 
     st.subheader("4. Log the outcome (fill in after the trade closes)")
@@ -117,19 +132,17 @@ if "last_result" in st.session_state:
                 writer.writerow({
                     "timestamp": datetime.utcnow().isoformat(),
                     "pair": pair,
+                    "environment": result["environment"],
                     "verdict": result["final_verdict"],
-                    "s_pass": result["stages"]["S"]["passed"],
-                    "c_pass": result["stages"]["C"]["passed"],
-                    "a_pass": result["stages"]["A"]["passed"],
-                    "l_pass": result["stages"]["L"]["passed"],
+                    "t_pass": result["stages"]["T"]["passed"],
                     "p_pass": result["stages"]["P"]["passed"],
+                    "e_pass": result["stages"]["E"]["passed"],
                     "failing_stages": "; ".join(result["failing_stages"]),
                     "outcome": outcome,
                     "notes": notes,
                 })
             st.success("Logged.")
 
-# --- Stats from log ------------------------------------------------------------
 if os.path.exists(LOG_PATH):
     st.subheader("Log summary")
     with open(LOG_PATH, newline="") as f:
@@ -145,4 +158,4 @@ if os.path.exists(LOG_PATH):
     c1.metric("Total logged", total)
     c2.metric("EXECUTE verdicts", len(executed))
     c3.metric("Decided (win/loss)", decided)
-    c4.metric("Win rate", f"{win_rate:.0f}%", help="Target: 50%")
+    c4.metric("Win rate", f"{win_rate:.0f}%")
