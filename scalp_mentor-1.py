@@ -1,10 +1,15 @@
 """
-S.C.A.L.P. AI Trading Mentor — Prototype
+Harmonized EMA 20/40 + Price Action AI Trading Mentor — Prototype
 
-Takes chart screenshots (1H, M5, M1) plus a few structured inputs
-(current time, pip value) and runs each SCALP stage as a separate
-Claude vision call with structured JSON output. Combines the stage
-results into a final execute/avoid verdict with reasoning.
+Implements the user's Harmonized EMA 20/40 strategy:
+  1H  -> Trend Filter (EMA 20/40 relationship + slope + market structure)
+  15M -> Pullback + POI + Liquidity sweep + rejection/engulfing/displacement
+  5M  -> MSS/Shift execution confirmation + entry/SL/TP with minimum R:R
+
+Each stage is a separate Claude vision call with structured JSON output.
+Later stages receive context from earlier ones. Final verdict is EXECUTE
+only if all three stages pass AND the resulting risk:reward meets the
+strategy's minimum target (default 1:4).
 
 SETUP:
     pip install anthropic --break-system-packages
@@ -13,19 +18,16 @@ SETUP:
 USAGE:
     python scalp_mentor.py \
         --h1 chart_1h.png \
+        --m15 chart_15m.png \
         --m5 chart_5m.png \
-        --m1 chart_1m.png \
-        --pair GBPUSD \
-        --current-time-gmt "09:15" \
-        --pip-value 0.0001
+        --pair XAUUSD \
+        --min-rr 1:4
 
-NOTE: This is a prototype / decision-support tool, not financial
-advice, and it does not place trades. It only reasons over the
-SCALP checklist you defined and reports where the setup passes or
-fails. Treat its output as a second opinion to check your own
-analysis against, not a signal to blindly follow — vision models
-can misread candle patterns and chart details, and past checklist
-performance is no guarantee of future results.
+NOTE: This is a decision-support / checklist tool, not financial advice,
+and it does not place trades. Treat its output as a second opinion to
+check your own chart reading against. Vision models can misread candle
+patterns and chart details, and past checklist performance is no
+guarantee of future results.
 """
 
 import argparse
@@ -33,13 +35,33 @@ import base64
 import json
 import os
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 import anthropic
 
-MODEL = "claude-sonnet-5"  # good balance of cost and reasoning quality for this checklist task
+MODEL = "claude-sonnet-5"
 MAX_TOKENS = 1500
+
+
+# ---------------------------------------------------------------------------
+# Instrument-specific stop-loss conventions (used only as a fallback
+# reference shown to the model — the strategy itself places SL beyond
+# the invalidating structure, not at a fixed distance).
+# ---------------------------------------------------------------------------
+
+INSTRUMENT_SL_CONFIG = {
+    "XAUUSD": {"unit": "USD (price points)", "range": "structure-dependent, typically $3-15"},
+    "NAS100": {"unit": "index points", "range": "structure-dependent, typically 15-60 points"},
+    "EURUSD": {"unit": "pips", "range": "structure-dependent, typically 5-15 pips"},
+    "GBPUSD": {"unit": "pips", "range": "structure-dependent, typically 5-15 pips"},
+}
+DEFAULT_SL_CONFIG = {"unit": "price units", "range": "structure-dependent (not yet configured for this instrument)"}
+DEFAULT_MIN_RR = "1:4"
+
+
+def get_sl_config(pair: str) -> dict:
+    return INSTRUMENT_SL_CONFIG.get(pair.upper(), DEFAULT_SL_CONFIG)
 
 
 # ---------------------------------------------------------------------------
@@ -54,141 +76,101 @@ class StageResult:
     reasoning: str
 
 
-STAGE_PROMPTS = {
-    "spot_impulse": """
-You are checking Stage S (Spot the Impulse) of a SCALP trading checklist.
+# NOTE ON CURLY BRACES: stages that use .format() have every literal
+# brace in the JSON example doubled ({{ }}) so Python's string
+# formatting doesn't try to interpret the example as a field name.
+# Stages with no injected variables are left as plain strings and are
+# NOT passed through .format() at all.
 
-Look at this 1-hour timeframe chart. Determine:
-1. Is there a clear break of structure (BOS) — a new higher-high (bullish)
-   or lower-low (bearish)?
-2. What is the impulse direction (bullish/bearish/none)?
-3. What price levels mark the External High and External Low of the
-   current range?
-4. Is a clean trading range defined?
+STAGE_PROMPTS = {
+    "trend_filter": """
+You are checking the 1H Trend Filter stage of a Harmonized EMA 20/40
++ Price Action strategy.
+
+Look at this 1-hour chart, which should show the 20-period EMA and
+40-period EMA. Determine:
+1. Is EMA 20 above EMA 40 (bullish) or below (bearish)?
+2. Are both EMAs sloping clearly in that direction (not flat)?
+3. Does market structure agree (higher-highs/higher-lows for bullish,
+   lower-highs/lower-lows for bearish)?
+4. Is price excessively extended away from the EMAs (overextended,
+   poor risk:reward from here)?
+5. Classify the environment: "bullish", "bearish", or "no_trade" (if
+   EMAs are repeatedly crossing, flat, or price is choppy/ranging).
 
 Respond ONLY with JSON, no other text, in this exact shape:
 {
   "passed": true/false,
-  "direction": "bullish" | "bearish" | "none",
-  "external_high": <number or null>,
-  "external_low": <number or null>,
+  "environment": "bullish" | "bearish" | "no_trade",
+  "ema_alignment_clear": true/false,
+  "structure_agrees": true/false,
+  "overextended": true/false,
   "reasoning": "<1-2 sentence explanation>"
 }
 """,
-    "premium_discount": """
-You are checking Stage C (Calculate Premium/Discount) of a SCALP checklist.
-
-Given the External High and External Low from Stage S ({external_high},
-{external_low}) and direction "{direction}", look at this chart and
-determine:
-1. Where is the 50% (fibonacci midpoint) of that range?
-2. Is current price in the premium zone (above 50%) or discount zone
-   (below 50%)?
-3. Does the zone match the rule: bearish setups need premium, bullish
-   setups need discount?
+    "pullback_poi_liquidity": """
+You are checking the 15M Pullback + POI + Liquidity stage of a
+Harmonized EMA 20/40 + Price Action strategy.
+Context: the 1H environment is "{environment}" (from the trend filter
+stage). Look at this 15-minute chart and determine:
+1. Has price pulled back toward the EMA 20-40 zone (without
+   necessarily crossing both EMAs)?
+2. Is there a meaningful Point of Interest at/near that zone — e.g.
+   prior support/resistance, order block, fair value gap, a previous
+   swing area, or a liquidity area? What type is it?
+3. Has price swept a recent obvious high (for a bearish setup) or low
+   (for a bullish setup) and then rejected?
+4. Is there price-action confirmation matching the "{environment}"
+   direction — a rejection candle, an engulfing candle, or clear
+   displacement?
 
 Respond ONLY with JSON:
 {
   "passed": true/false,
-  "fifty_percent_level": <number or null>,
-  "current_zone": "premium" | "discount" | "unclear",
+  "pullback_to_ema_zone": true/false,
+  "poi_type": "<short description or none>",
+  "liquidity_swept": true/false,
+  "confirmation_type": "rejection" | "engulfing" | "displacement" | "none",
   "reasoning": "<1-2 sentence explanation>"
 }
 """,
-    "assess_poi": """
-You are checking Stage A (Assess POIs) of a SCALP checklist.
+    "execution_and_risk": """
+You are checking the 5M Execution + Risk/Target stage of a Harmonized
+EMA 20/40 + Price Action strategy.
 
-Look at this chart (1H context and M5 detail if provided). Determine:
-1. Is there a valid Point of Interest — an Extreme zone (origination
-   order block / RIFC) or a Decisional zone (the area responsible for
-   the BOS)?
-2. On the lower timeframe, is there a visible buildup -> inducement ->
-   push-out sequence at that POI?
-3. Is the POI fresh (unmitigated) rather than already tapped through?
+Context: 1H environment is "{environment}". Instrument: {pair}.
+Stop-loss unit for this instrument: {sl_unit}. Minimum acceptable
+risk:reward ratio for this strategy: {min_rr}.
+
+Look at this 5-minute chart and determine:
+1. Is there a valid Market Structure Shift (MSS) or "Change of
+   Character" confirming the "{environment}" direction on this
+   timeframe?
+2. What would the entry price be, based on that shift/confirmation?
+3. Where would the stop-loss go — it must sit beyond the structure
+   that would invalidate this setup (not a fixed arbitrary distance).
+   State the stop-loss price and the distance in {sl_unit}.
+4. What is the next meaningful opposing liquidity/POI/structure level
+   that could serve as the take-profit target?
+5. Calculate the resulting risk:reward ratio from entry/SL/TP. Does
+   it meet or exceed the minimum ({min_rr})? If not, this stage fails
+   regardless of how clean the setup looks, per the strategy's rule
+   that a trade is only valid if it clears the minimum R:R.
 
 Respond ONLY with JSON:
 {
   "passed": true/false,
-  "poi_type": "extreme" | "decisional" | "none",
-  "buildup_inducement_pushout_seen": true/false,
-  "poi_fresh": true/false,
-  "reasoning": "<1-2 sentence explanation>"
-}
-""",
-    "liquidity_grab": """
-You are checking Stage L (Liquidity Grab) of a SCALP checklist.
-
-Context: current time is {current_time_gmt} GMT. The key time window
-for this strategy is around London open (09:00 GMT).
-
-Look at this chart. Determine:
-1. Has price swept a liquidity pool at/near the POI (e.g. prior
-   session high/low, trendline liquidity, equal highs/lows, or an
-   SMC-style trap)?
-2. Is there inducement visible within roughly 30 minutes of the key
-   time window?
-3. Given the supplied current time, are we inside a reasonable window
-   of the key session time?
-
-Respond ONLY with JSON:
-{
-  "passed": true/false,
-  "liquidity_pool_type": "<short description or none>",
-  "inducement_near_key_time": true/false,
-  "within_key_time_window": true/false,
-  "reasoning": "<1-2 sentence explanation>"
-}
-""",
-    "position_entry": """
-You are checking Stage P (Position Entry) of a SCALP checklist.
-
-Instrument: {pair}. Stop-loss unit for this instrument: {sl_unit}.
-Reference stop-loss range for this instrument: {sl_range}.
-
-Look at this M1 chart. Determine:
-1. Is there a valid entry trigger — BOS, 2-Leg pullback, or a
-   Buildup-Inducement-BOS pattern on M1?
-2. What price would the entry be at, based on a refined IFC
-   (inefficiency/imbalance close) point?
-3. Based on nearby structure, what stop-loss distance (in {sl_unit})
-   would this require? Flag if the visible structure would require
-   a stop meaningfully outside the reference range above.
-4. What would the take-profit be at a fixed 1:3 risk:reward from
-   that entry/stop?
-
-Respond ONLY with JSON:
-{
-  "passed": true/false,
-  "entry_trigger": "<description or none>",
+  "mss_confirmed": true/false,
   "entry_price": <number or null>,
+  "stop_loss_price": <number or null>,
   "stop_loss_distance": <number or null>,
-  "stop_loss_unit": "{sl_unit}",
   "take_profit_price": <number or null>,
+  "calculated_rr": "<e.g. '1:4.2' or null>",
+  "meets_min_rr": true/false,
   "reasoning": "<1-2 sentence explanation>"
 }
 """,
 }
-
-
-# ---------------------------------------------------------------------------
-# Instrument-specific stop-loss conventions
-# ---------------------------------------------------------------------------
-
-# SCALP's "3-7 pip" stop was defined for forex majors. Gold and indices
-# don't use pips, so define the right unit + a reasonable reference range
-# per instrument here. Adjust these to match your own backtested numbers.
-INSTRUMENT_SL_CONFIG = {
-    "XAUUSD": {"unit": "USD (price points)", "range": "$3-7"},
-    "NAS100": {"unit": "index points", "range": "15-40 points"},
-    "EURUSD": {"unit": "pips", "range": "3-7 pips"},
-    "GBPUSD": {"unit": "pips", "range": "3-7 pips"},
-}
-
-DEFAULT_SL_CONFIG = {"unit": "price units", "range": "instrument-appropriate range (not yet configured)"}
-
-
-def get_sl_config(pair: str) -> dict:
-    return INSTRUMENT_SL_CONFIG.get(pair.upper(), DEFAULT_SL_CONFIG)
 
 
 # ---------------------------------------------------------------------------
@@ -233,12 +215,11 @@ def call_stage(client: anthropic.Anthropic, prompt: str, image_path: str) -> dic
             }
         ],
     )
-
     text = "".join(block.text for block in response.content if block.type == "text")
     text = text.strip()
-    # Strip markdown fences if the model added them despite instructions
-    if text.startswith("```"):
-        text = text.split("```")[1]
+    if text.startswith("
+        text = text.split("
+")[1]
         if text.startswith("json"):
             text = text[4:]
         text = text.strip()
@@ -252,48 +233,47 @@ def call_stage(client: anthropic.Anthropic, prompt: str, image_path: str) -> dic
 def run_scalp_analysis(
     client: anthropic.Anthropic,
     h1_path: str,
+    m15_path: str,
     m5_path: str,
-    m1_path: str,
     pair: str,
-    current_time_gmt: str,
+    sl_unit: str = None,
+    min_rr: str = DEFAULT_MIN_RR,
 ) -> dict:
+    """
+    Runs the 3-stage Harmonized EMA 20/40 pipeline:
+      1H  trend_filter
+      15M pullback_poi_liquidity
+      5M  execution_and_risk
+    """
     results: dict[str, StageResult] = {}
+    default_sl_config = get_sl_config(pair)
+    effective_sl_unit = sl_unit or default_sl_config["unit"]
 
-    # Stage S — Spot the Impulse (1H chart)
-    s = call_stage(client, STAGE_PROMPTS["spot_impulse"], h1_path)
-    results["S"] = StageResult("Spot the Impulse", s.get("passed", False), s, s.get("reasoning", ""))
+    # Stage 1 — Trend Filter (1H chart) — no injected variables, call directly
+    t = call_stage(client, STAGE_PROMPTS["trend_filter"], h1_path)
+    results["T"] = StageResult("Trend Filter (1H)", t.get("passed", False), t, t.get("reasoning", ""))
+    environment = t.get("environment", "no_trade")
 
-    # Stage C — Premium/Discount (1H chart, needs Stage S output)
-    c_prompt = STAGE_PROMPTS["premium_discount"].format(
-        external_high=s.get("external_high"),
-        external_low=s.get("external_low"),
-        direction=s.get("direction"),
+    # Stage 2 — Pullback + POI + Liquidity (15M chart)
+    p_prompt = STAGE_PROMPTS["pullback_poi_liquidity"].format(environment=environment)
+    p = call_stage(client, p_prompt, m15_path)
+    results["P"] = StageResult("Pullback/POI/Liquidity (15M)", p.get("passed", False), p, p.get("reasoning", ""))
+
+    # Stage 3 — Execution + Risk/Target (5M chart)
+    e_prompt = STAGE_PROMPTS["execution_and_risk"].format(
+        environment=environment, pair=pair, sl_unit=effective_sl_unit, min_rr=min_rr
     )
-    c = call_stage(client, c_prompt, h1_path)
-    results["C"] = StageResult("Premium/Discount", c.get("passed", False), c, c.get("reasoning", ""))
+    e = call_stage(client, e_prompt, m5_path)
+    results["E"] = StageResult("Execution/Risk (5M)", e.get("passed", False), e, e.get("reasoning", ""))
 
-    # Stage A — Assess POIs (M5 chart)
-    a = call_stage(client, STAGE_PROMPTS["assess_poi"], m5_path)
-    results["A"] = StageResult("Assess POIs", a.get("passed", False), a, a.get("reasoning", ""))
-
-    # Stage L — Liquidity Grab (M5 chart, needs current time)
-    l_prompt = STAGE_PROMPTS["liquidity_grab"].format(current_time_gmt=current_time_gmt)
-    l = call_stage(client, l_prompt, m5_path)
-    results["L"] = StageResult("Liquidity Grab", l.get("passed", False), l, l.get("reasoning", ""))
-
-    # Stage P — Position Entry (M1 chart, needs instrument-specific SL config)
-    sl_config = get_sl_config(pair)
-    p_prompt = STAGE_PROMPTS["position_entry"].format(
-        pair=pair, sl_unit=sl_config["unit"], sl_range=sl_config["range"]
-    )
-    p = call_stage(client, p_prompt, m1_path)
-    results["P"] = StageResult("Position Entry", p.get("passed", False), p, p.get("reasoning", ""))
-
-    all_passed = all(r.passed for r in results.values())
+    all_passed = all(r.passed for r in results.values()) and environment != "no_trade"
     failing_stages = [f"{k} ({r.stage})" for k, r in results.items() if not r.passed]
+    if environment == "no_trade":
+        failing_stages.insert(0, "T (1H environment classified as no_trade)")
 
     verdict = {
         "pair": pair,
+        "environment": environment,
         "final_verdict": "EXECUTE" if all_passed else "AVOID",
         "stages": {k: {"passed": r.passed, "details": r.details, "reasoning": r.reasoning} for k, r in results.items()},
         "failing_stages": failing_stages,
@@ -306,12 +286,13 @@ def run_scalp_analysis(
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="SCALP AI Trading Mentor")
-    parser.add_argument("--h1", required=True, help="Path to 1H chart screenshot")
-    parser.add_argument("--m5", required=True, help="Path to M5 chart screenshot")
-    parser.add_argument("--m1", required=True, help="Path to M1 chart screenshot")
-    parser.add_argument("--pair", required=True, help="e.g. GBPUSD")
-    parser.add_argument("--current-time-gmt", required=True, help="e.g. 09:15")
+    parser = argparse.ArgumentParser(description="Harmonized EMA 20/40 AI Trading Mentor")
+    parser.add_argument("--h1", required=True, help="Path to 1H chart screenshot (with EMA 20/40)")
+    parser.add_argument("--m15", required=True, help="Path to 15M chart screenshot")
+    parser.add_argument("--m5", required=True, help="Path to 5M chart screenshot")
+    parser.add_argument("--pair", required=True, help="e.g. XAUUSD")
+    parser.add_argument("--sl-unit", default=None, help="Override stop-loss unit, e.g. 'pips' or 'USD'")
+    parser.add_argument("--min-rr", default=DEFAULT_MIN_RR, help="Minimum acceptable risk:reward, e.g. '1:4'")
     args = parser.parse_args()
 
     api_key = os.environ.get("ANTHROPIC_API_KEY")
@@ -321,18 +302,13 @@ def main():
 
     client = anthropic.Anthropic(api_key=api_key)
 
-    print(f"Running SCALP analysis for {args.pair}...\n")
+    print(f"Running Harmonized EMA 20/40 analysis for {args.pair}...\n")
     result = run_scalp_analysis(
-        client,
-        args.h1,
-        args.m5,
-        args.m1,
-        args.pair,
-        args.current_time_gmt,
+        client, args.h1, args.m15, args.m5, args.pair,
+        sl_unit=args.sl_unit, min_rr=args.min_rr,
     )
-
-    print("=" * 60)
-    print(f"VERDICT: {result['final_verdict']}")
+print("=" * 60)
+    print(f"VERDICT: {result['final_verdict']}  (1H environment: {result['environment']})")
     print("=" * 60)
     for stage_key, stage_data in result["stages"].items():
         status = "PASS" if stage_data["passed"] else "FAIL"
@@ -345,5 +321,5 @@ def main():
     print("\n(This is a checklist tool, not financial advice — verify against your own reading of the chart.)")
 
 
-if __name__ == "__main__":
+if name == "main":
     main()
